@@ -53,6 +53,16 @@ static void my_application_activate(GApplication* application) {
   }
 
   gtk_window_set_default_size(window, 1280, 840);
+  // Window/taskbar icon from the bundled asset (the .deb also installs a
+  // themed icon matched through the desktop file).
+  g_autofree gchar* exe = g_file_read_link("/proc/self/exe", nullptr);
+  if (exe != nullptr) {
+    g_autofree gchar* dir = g_path_get_dirname(exe);
+    g_autofree gchar* icon = g_build_filename(
+        dir, "data", "flutter_assets", "assets", "images", "app_icon.png",
+        nullptr);
+    gtk_window_set_icon_from_file(window, icon, nullptr);
+  }
   // Below this the sidebar + two-column pages no longer fit.
   GdkGeometry hints = {};
   hints.min_width = 960;

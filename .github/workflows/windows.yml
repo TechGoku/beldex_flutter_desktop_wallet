@@ -1,0 +1,112 @@
+name: Windows build
+
+# Builds the Windows installer (.exe) and a portable .zip. Pushing a v* tag
+# also publishes them as a pre-release; manual runs keep them as artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: 3.47.5
+  BELDEX_VERSION: 7.0.4
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Read app version
+        id: version
+        shell: bash
+        run: |
+          echo "version=$(grep '^version:' pubspec.yaml | sed 's/version: *//; s/+.*//')" >> "$GITHUB_OUTPUT"
+
+      - name: Build app
+        shell: bash
+        # Swap keys are optional repository secrets; empty values leave swaps unconfigured.
+        env:
+          CHANGELLY_SWAP_API_KEY: ${{ secrets.CHANGELLY_SWAP_API_KEY }}
+          CHANGELLY_SWAP_PRIVATE_KEY: ${{ secrets.CHANGELLY_SWAP_PRIVATE_KEY }}
+          CHANGELLY_PRIVACY_SWAP_API_KEY: ${{ secrets.CHANGELLY_PRIVACY_SWAP_API_KEY }}
+          CHANGELLY_PRIVACY_SWAP_PRIVATE_KEY: ${{ secrets.CHANGELLY_PRIVACY_SWAP_PRIVATE_KEY }}
+          QUICKEX_SWAP_PUPLIC_KEY: ${{ secrets.QUICKEX_SWAP_PUPLIC_KEY }}
+          QUICKEX_SWAP_SECRET_KEY: ${{ secrets.QUICKEX_SWAP_SECRET_KEY }}
+          QUICKEX_REFERRER_ID: ${{ secrets.QUICKEX_REFERRER_ID }}
+        run: |
+          flutter pub get
+          flutter build windows --release \
+            "--dart-define=CHANGELLY_SWAP_API_KEY=$CHANGELLY_SWAP_API_KEY" \
+            "--dart-define=CHANGELLY_SWAP_PRIVATE_KEY=$CHANGELLY_SWAP_PRIVATE_KEY" \
+            "--dart-define=CHANGELLY_PRIVACY_SWAP_API_KEY=$CHANGELLY_PRIVACY_SWAP_API_KEY" \
+            "--dart-define=CHANGELLY_PRIVACY_SWAP_PRIVATE_KEY=$CHANGELLY_PRIVACY_SWAP_PRIVATE_KEY" \
+            "--dart-define=QUICKEX_SWAP_PUPLIC_KEY=$QUICKEX_SWAP_PUPLIC_KEY" \
+            "--dart-define=QUICKEX_SWAP_SECRET_KEY=$QUICKEX_SWAP_SECRET_KEY" \
+            "--dart-define=QUICKEX_REFERRER_ID=$QUICKEX_REFERRER_ID"
+
+      - name: Bundle beldexd and beldex-wallet-rpc
+        shell: bash
+        run: |
+          curl -fsSL -o beldex.zip \
+            "https://github.com/Beldex-Coin/beldex/releases/download/v${BELDEX_VERSION}/beldex-win-x64-${BELDEX_VERSION}.zip"
+          7z x -y -obeldex beldex.zip > /dev/null
+          out=build/windows/x64/runner/Release/bin
+          mkdir -p "$out"
+          find beldex -type f \( -name beldexd.exe -o -name beldex-wallet-rpc.exe -o -name '*.dll' \) -exec cp {} "$out/" \;
+          ls -la "$out"
+          test -f "$out/beldexd.exe" && test -f "$out/beldex-wallet-rpc.exe"
+
+      - name: Bundle the Visual C++ runtime
+        shell: bash
+        run: |
+          for dll in msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
+            cp "/c/Windows/System32/$dll" build/windows/x64/runner/Release/
+          done
+
+      - name: Portable zip
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp -r build/windows/x64/runner/Release "dist/Beldex Wallet"
+          (cd dist && 7z a -tzip "beldex-flutter-wallet-${{ steps.version.outputs.version }}-windows-x64-portable.zip" "Beldex Wallet" > /dev/null)
+          rm -rf "dist/Beldex Wallet"
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.version }}" windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build\installer\*.exe dist\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beldex-flutter-wallet-windows
+          path: dist/*
+
+      - name: Publish pre-release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Beldex Wallet ${{ github.ref_name }} (test build)
+          prerelease: true
+          files: dist/*
+          body: |
+            Test build of the Beldex desktop wallet (Flutter) for Windows x64.
+
+            - `*-setup.exe`: installer (per-user by default, no admin needed)
+            - `*-portable.zip`: unzip and run `beldex_wallet.exe`
+
+            Bundles beldexd / beldex-wallet-rpc v${{ env.BELDEX_VERSION }}. The executables are
+            not code-signed, so Windows SmartScreen may warn on first run.

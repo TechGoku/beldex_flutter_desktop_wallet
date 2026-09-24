@@ -89,13 +89,13 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "io.beldex" "\0"
-            VALUE "FileDescription", "beldex_wallet" "\0"
+            VALUE "CompanyName", "Beldex" "\0"
+            VALUE "FileDescription", "Beldex Wallet" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "beldex_wallet" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 io.beldex. All rights reserved." "\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Beldex. All rights reserved." "\0"
             VALUE "OriginalFilename", "beldex_wallet.exe" "\0"
-            VALUE "ProductName", "beldex_wallet" "\0"
+            VALUE "ProductName", "Beldex Wallet" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

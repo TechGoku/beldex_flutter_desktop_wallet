@@ -55,6 +55,16 @@ Swap API keys are compiled in, as in the Electron build:
     --dart-define=CHANGELLY_PRIVACY_SWAP_API_KEY=... --dart-define=CHANGELLY_PRIVACY_SWAP_PRIVATE_KEY=...
     --dart-define=QUICKEX_SWAP_PUPLIC_KEY=... --dart-define=QUICKEX_SWAP_SECRET_KEY=... --dart-define=QUICKEX_REFERRER_ID=...
 
+## Packaging
+- **Linux .deb**: `flutter build linux --release`, then
+  `BELDEX_BIN_DIR=/path/to/beldex/bin linux/packaging/build_deb.sh [out_dir]`. Installs to
+  `/opt/beldex-flutter-wallet` with a `beldex-flutter-wallet` command, desktop entry and icons.
+- **Windows .exe**: built by `.github/workflows/windows.yml` on a Windows runner (Flutter can't
+  cross-compile for Windows). Pushing a `v*` tag publishes an Inno Setup installer
+  (`windows/installer.iss`) and a portable zip as a pre-release; manual runs keep them as
+  artifacts. It bundles beldexd / beldex-wallet-rpc from the Beldex-Coin/beldex release and the
+  Visual C++ runtime. Swap keys come from optional repository secrets.
+
 ## Tests
     flutter test test/core_test.dart
     BELDEX_BIN_DIR=/path/to/bin flutter test test/live_wallet_test.dart   # real wallet-rpc + public node
