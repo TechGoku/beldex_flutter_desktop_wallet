@@ -468,12 +468,13 @@ class _SyncStatus extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final height = context.select<WalletService, int>((w) => w.height);
-    final target = context.select<DaemonService, int>((d) => d.info.height);
+    context.select<DaemonService, int>((d) => d.info.height);
+    final status = context.watch<WalletService>().syncStatus;
+    final target = status.target;
     final config = context.read<AppController>().config;
     final node = nodeLabel(config.daemon);
     final net = config.netType;
-    final sync = syncState(height, target);
+    final sync = syncView(status);
     return Container(
       margin: const EdgeInsets.only(top: 10),
       padding: const EdgeInsets.fromLTRB(18, 12, 14, 14),
@@ -490,6 +491,10 @@ class _SyncStatus extends StatelessWidget {
             ],
           ),
           if (!sync.synced && target > 0) ...[const SizedBox(height: 8), GlowProgress(sync.progress)],
+          if (sync.detail != null) ...[
+            const SizedBox(height: 6),
+            Text(sync.detail!, style: const TextStyle(fontSize: 11.5, color: BeldexColors.muted)),
+          ],
           const SizedBox(height: 6),
           Text(
             target == 0 ? node : 'Block ${groupDigits(target)} · $node',
@@ -503,24 +508,51 @@ class _SyncStatus extends StatelessWidget {
   }
 }
 
-typedef SyncState = ({bool synced, double progress, String label, Color color, IconData icon});
+typedef SyncState = ({bool synced, double progress, String label, String? detail, Color color, IconData icon});
 
-SyncState syncState(int walletHeight, int nodeHeight) {
-  if (nodeHeight == 0) {
-    return (synced: false, progress: 0, label: 'Connecting…', color: BeldexColors.amber, icon: Icons.sync);
-  }
-  // The wallet normally trails the node by a block or two between polls
-  final synced = walletHeight >= nodeHeight - 3;
-  final progress = (walletHeight / nodeHeight).clamp(0.0, 1.0);
-  return synced
-      ? (synced: true, progress: 1, label: 'Synced', color: BeldexColors.green, icon: Icons.circle)
-      : (
-          synced: false,
-          progress: progress,
-          label: 'Scanning ${(progress * 100).toStringAsFixed(1)}%',
-          color: BeldexColors.amber,
-          icon: Icons.sync,
-        );
+SyncState syncView(SyncStatus s) => switch (s.phase) {
+  SyncPhase.connecting => (
+    synced: false,
+    progress: 0,
+    label: 'Connecting…',
+    detail: null,
+    color: BeldexColors.amber,
+    icon: Icons.sync,
+  ),
+  SyncPhase.headers => (
+    synced: false,
+    progress: s.progress,
+    label: 'Fetching block list ${(s.progress * 100).toStringAsFixed(0)}%',
+    detail: 'Up to the restore height; nothing to scan there',
+    color: BeldexColors.amber,
+    icon: Icons.sync,
+  ),
+  SyncPhase.scanning => (
+    synced: false,
+    progress: s.progress,
+    label: 'Scanning ${(s.progress * 100).toStringAsFixed(1)}%',
+    detail: [
+      '${groupDigits(s.remainingBlocks)} blocks left',
+      if (s.blocksPerSecond >= 1) '${groupDigits(s.blocksPerSecond.round())}/s',
+      if (s.eta case final eta?) '~${formatEta(eta)}',
+    ].join(' · '),
+    color: BeldexColors.amber,
+    icon: Icons.sync,
+  ),
+  SyncPhase.synced => (
+    synced: true,
+    progress: 1,
+    label: 'Synced',
+    detail: null,
+    color: BeldexColors.green,
+    icon: Icons.circle,
+  ),
+};
+
+String formatEta(Duration d) {
+  if (d.inMinutes < 1) return '<1 min';
+  if (d.inHours < 1) return '${d.inMinutes} min';
+  return '${d.inHours} h ${d.inMinutes % 60} min';
 }
 
 // ---------------------------------------------------------------------------
@@ -734,9 +766,10 @@ class _NetworkPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final app = context.read<AppController>();
-    final height = context.select<WalletService, int>((w) => w.height);
     final info = context.select<DaemonService, DaemonInfo>((d) => d.info);
-    final sync = syncState(height, info.height);
+    final wallet = context.watch<WalletService>();
+    final height = wallet.height;
+    final sync = syncView(wallet.syncStatus);
     final net = app.config.netType;
     return Panel(
       title: 'Network',
@@ -747,6 +780,7 @@ class _NetworkPanel extends StatelessWidget {
           IconLabel(sync.icon, sync.label, color: sync.color, size: 13),
           const SizedBox(height: 10),
           GlowProgress(info.height == 0 ? 0 : sync.progress),
+          if (sync.detail != null) ...[const SizedBox(height: 8), Muted(sync.detail!, size: 12)],
           const SizedBox(height: 8),
           DetailLine.text('Wallet height', height == 0 ? '…' : groupDigits(height)),
           DetailLine.text('Node height', info.height == 0 ? '…' : groupDigits(info.height)),

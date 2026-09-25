@@ -160,3 +160,44 @@ class WalletException implements Exception {
   @override
   String toString() => message ?? i18nKey ?? 'WalletException';
 }
+
+enum SyncPhase {
+  /// No node height yet.
+  connecting,
+
+  /// Fetching block hashes up to the restore height (nothing to scan there).
+  headers,
+
+  /// Scanning blocks for the wallet's transactions.
+  scanning,
+
+  /// Caught up with the node.
+  synced,
+}
+
+class SyncStatus {
+  const SyncStatus({required this.phase, this.height = 0, this.target = 0, this.from = 0, this.blocksPerSecond = 0});
+
+  final SyncPhase phase;
+  final int height;
+  final int target;
+
+  /// Where this scan started, so the percentage covers the blocks actually
+  /// being scanned rather than the whole chain.
+  final int from;
+  final double blocksPerSecond;
+
+  int get remainingBlocks => (target - height).clamp(0, 1 << 62);
+
+  double get progress {
+    if (phase == SyncPhase.synced) return 1;
+    if (target == 0) return 0;
+    if (phase == SyncPhase.scanning && target > from) return ((height - from) / (target - from)).clamp(0.0, 1.0);
+    return (height / target).clamp(0.0, 1.0);
+  }
+
+  Duration? get eta {
+    if (phase != SyncPhase.scanning || blocksPerSecond < 1) return null;
+    return Duration(seconds: (remainingBlocks / blocksPerSecond).ceil());
+  }
+}

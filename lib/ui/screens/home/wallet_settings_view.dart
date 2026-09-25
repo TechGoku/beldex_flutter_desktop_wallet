@@ -280,47 +280,113 @@ class WalletSettingsView extends StatelessWidget {
 
   Future<void> _rescan(BuildContext context) async {
     final wallet = context.read<WalletService>();
+    final from = TextEditingController();
+    String? error;
+    var busy = false;
+
+    void start(int? fromHeight) {
+      unawaited(
+        wallet.rescanBlockchain(fromHeight: fromHeight).catchError((Object e) {
+          if (context.mounted) showSnack(context, errorText(e), error: true);
+        }),
+      );
+      showSnack(
+        context,
+        fromHeight == null ? 'Rescanning from the restore height' : 'Rescanning from block $fromHeight',
+      );
+    }
+
     await showBModal<void>(
       context,
+      width: 480,
       builder: (ctx) {
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const H2('Rescan'),
-            const Muted(
-              'Rescan spent outputs to fix a wrong balance quickly. A full rescan re-reads the whole chain from the wallet\'s restore height (slow; history is rebuilt).',
-            ),
-            const SizedBox(height: 16),
-            GhostButton(
-              'Rescan spent outputs',
-              onPressed: () async {
-                Navigator.pop(ctx);
-                try {
-                  await wallet.rescanSpent();
-                  if (context.mounted) showSnack(context, 'Spent outputs rescanned');
-                } catch (e) {
-                  if (context.mounted) showSnack(context, errorText(e), error: true);
+        return StatefulBuilder(
+          builder: (ctx, setState) {
+            Future<void> fromInput() async {
+              final text = from.text.trim();
+              setState(() {
+                error = null;
+                busy = true;
+              });
+              try {
+                int? height = int.tryParse(text.replaceAll(',', ''));
+                if (height == null) {
+                  final date = DateTime.tryParse(text);
+                  if (date == null) throw const FormatException();
+                  height = await wallet.heightForDate(date);
                 }
-              },
-            ),
-            const SizedBox(height: 8),
-            PrimaryButton(
-              'Full rescan',
-              onPressed: () {
-                Navigator.pop(ctx);
-                unawaited(
-                  wallet.rescanBlockchain().catchError((Object e) {
-                    if (context.mounted) showSnack(context, errorText(e), error: true);
-                  }),
-                );
-              },
-            ),
-            const SizedBox(height: 8),
-            GhostButton('Cancel', onPressed: () => Navigator.pop(ctx)),
-          ],
+                if (ctx.mounted) Navigator.pop(ctx);
+                start(height);
+              } catch (_) {
+                setState(() {
+                  busy = false;
+                  error = 'Enter a block height (e.g. 5700000) or a date (e.g. 2026-01-31)';
+                });
+              }
+            }
+
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const H2('Rescan'),
+                const Muted(
+                  'Rescans save their progress as they go: you can keep using the wallet, close it or quit, '
+                  'and it carries on where it stopped.',
+                ),
+                const SizedBox(height: 16),
+                const SectionLabel('Wrong balance'),
+                GhostButton(
+                  'Rescan spent outputs (seconds)',
+                  onPressed: () async {
+                    Navigator.pop(ctx);
+                    try {
+                      await wallet.rescanSpent();
+                      if (context.mounted) showSnack(context, 'Spent outputs rescanned');
+                    } catch (e) {
+                      if (context.mounted) showSnack(context, errorText(e), error: true);
+                    }
+                  },
+                ),
+                const SectionLabel('Missing transactions'),
+                const Muted(
+                  'Fastest: rescan from a block height or date shortly before the missing transactions; '
+                  'blocks before it are skipped. A rescan never goes below the height the wallet was '
+                  'restored from: for older transactions, restore the wallet again with an earlier date.',
+                  size: 12,
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Field(
+                        controller: from,
+                        hint: 'Height or date (YYYY-MM-DD)',
+                        errorText: error,
+                        onSubmitted: (_) => fromInput(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    PrimaryButton('Rescan from', expand: false, busy: busy, onPressed: fromInput),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                GhostButton(
+                  'Full rescan from the restore height',
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    start(null);
+                  },
+                ),
+                const SizedBox(height: 8),
+                GhostButton('Cancel', onPressed: () => Navigator.pop(ctx)),
+              ],
+            );
+          },
         );
       },
     );
+    from.dispose();
   }
 
   Future<void> _keyImages(BuildContext context) async {

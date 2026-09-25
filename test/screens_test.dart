@@ -45,6 +45,7 @@ AppController _app() {
     ..name = 'Savings'
     ..address = _addr
     ..height = 5774902
+    ..debugMarkSynced()
     ..balance = 1284500000000
     ..unlockedBalance = 1204500000000
     ..walletList = WalletList(

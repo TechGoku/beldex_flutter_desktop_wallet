@@ -4,10 +4,31 @@ import 'package:beldex_wallet/core/config.dart';
 import 'package:beldex_wallet/core/format.dart';
 import 'package:beldex_wallet/core/password_hash.dart';
 import 'package:beldex_wallet/core/validators.dart';
+import 'package:beldex_wallet/services/daemon_proxy.dart';
 import 'package:beldex_wallet/services/models.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('reads uint64 fields from epee binary responses', () {
+    List<int> u64Field(String name, int value) {
+      final bytes = ByteData(8)..setUint64(0, value, Endian.little);
+      return [name.length, ...name.codeUnits, 5, ...bytes.buffer.asUint8List()];
+    }
+
+    // Shaped like a get_blocks.bin reply: a big blob first, then the heights
+    final body = Uint8List.fromList([
+      1, 17, 1, 1, 1, 1, 2, 1, 1, // epee signature + version
+      ...List.filled(5000, 7), // stands in for the blocks array
+      ...u64Field('start_height', 5770000),
+      ...u64Field('current_height', 5776831),
+      6, ...'status'.codeUnits, 10, 8, ...'OK'.codeUnits,
+    ]);
+    expect(readEpeeUint64(body, 'start_height'), 5770000);
+    expect(readEpeeUint64(body, 'current_height'), 5776831);
+    expect(readEpeeUint64(body, 'missing'), isNull);
+    expect(readEpeeUint64(Uint8List(4), 'start_height'), isNull);
+  });
+
   test('parseBdx is exact and rejects bad input', () {
     expect(parseBdx('1'), 1000000000);
     expect(parseBdx('0.1'), 100000000);

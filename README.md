@@ -28,9 +28,32 @@ Changelly / QuickEx. Uses the same translations as the Electron wallet.
 ## How it works
 The app spawns `beldex-wallet-rpc` (and `beldexd` for a local node) and talks to
 them directly over JSON-RPC (HTTP Basic auth, random per-launch credentials,
-bound to 127.0.0.1). Sync design: scanning starts immediately on open (explicit
-`refresh`), auto-refresh every 10 s, cheap heartbeat, incremental `get_transfers`,
-heavy work deferred while scanning, automatic failover when the remote node is down.
+bound to 127.0.0.1).
+
+**Sync.** wallet-rpc can't be interrupted once it starts scanning: every call waits
+until the wallet has caught up, so closing mid-scan used to lose everything scanned
+since the last save. The app therefore puts a small local proxy
+(`lib/services/daemon_proxy.dart`) between wallet-rpc and the node and drives
+refreshes itself (wallet-rpc's auto refresh is off):
+- scans run in 30 s chunks; the proxy ends each chunk by failing the block-sync
+  requests, the app reads height and balance, saves every 60 s, and starts the next
+  chunk from the same block;
+- closing, switching wallets or quitting ends a scan in well under a second and
+  saves it, so reopening carries on where it stopped;
+- a user action during a scan ends the current chunk so it is answered at once;
+- live progress, speed and time left come from the block responses the proxy sees;
+- block-hash batches far below the tip are cached on disk, which makes restores and
+  rescans skip ~10 s of hash downloads;
+- rescans can start from a block height or date (blocks before it are skipped; an
+  unfinished one carries on after a restart). wallet2 never scans below a wallet's own
+  restore height, so older transactions need a fresh restore with an earlier date;
+- quitting sends `stop_wallet` on a non-keep-alive connection and closes the pool, as
+  wallet-rpc's server only exits once idle client connections are gone.
+
+wallet-rpc scans as fast as `beldex-wallet-cli` (measured interleaved on the same node
+and block range); speed mostly depends on the node. Transfers are fetched
+incrementally, heavy work is deferred while scanning, and the app fails over to a
+public node when the configured remote node is down.
 
 Wallet files default to `~/Beldex/wallets` and swap history to `~/Beldex/beldex_wallet.db`,
 the same as the Electron wallet, so both apps share them. Config is separate.

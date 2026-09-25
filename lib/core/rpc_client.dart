@@ -70,13 +70,16 @@ class JsonRpcClient {
 
   /// Calls [method]; throws [RpcError] on RPC or transport errors.
   /// [timeout] starts when the request is actually sent, not when queued.
+  /// [closeConnection] closes the connection after the reply instead of
+  /// keeping it for reuse.
   Future<Map<String, dynamic>> call(
     String method, {
     Map<String, dynamic>? params,
     Duration? timeout,
     Uri? endpointOverride,
+    bool closeConnection = false,
   }) {
-    return _queue.add(() => _send(method, params, timeout, endpointOverride));
+    return _queue.add(() => _send(method, params, timeout, endpointOverride, closeConnection));
   }
 
   Future<Map<String, dynamic>> _send(
@@ -84,6 +87,7 @@ class JsonRpcClient {
     Map<String, dynamic>? params,
     Duration? timeout,
     Uri? endpointOverride,
+    bool closeConnection,
   ) async {
     final body = <String, dynamic>{
       'jsonrpc': '2.0',
@@ -93,7 +97,11 @@ class JsonRpcClient {
     };
     http.Response response;
     try {
-      var request = _http.post(endpointOverride ?? endpoint, headers: _headers, body: jsonEncode(body));
+      var request = _http.post(
+        endpointOverride ?? endpoint,
+        headers: {..._headers, if (closeConnection) 'Connection': 'close'},
+        body: jsonEncode(body),
+      );
       if (timeout != null) request = request.timeout(timeout);
       response = await request;
     } on TimeoutException catch (e) {

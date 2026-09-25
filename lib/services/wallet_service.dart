@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
@@ -9,16 +10,22 @@ import '../core/config.dart';
 import '../core/password_hash.dart';
 import '../core/rpc_client.dart';
 import 'binaries.dart';
+import 'daemon_proxy.dart';
 import 'daemon_service.dart';
 import 'models.dart';
 
 /// Runs beldex-wallet-rpc and exposes the open wallet's state.
 ///
-/// Sync design (same as the optimised Electron wallet):
-///  * wallet-rpc refreshes inside its only request thread and otherwise
-///    waits 20 s between refreshes, so on open we trigger `refresh` at once
-///    and lower the auto-refresh period to 10 s;
-///  * the heartbeat only polls cheap calls (height, balance);
+/// Sync design:
+///  * wallet-rpc talks to the node through [DaemonProxy], and the app drives
+///    every refresh itself (wallet-rpc's auto refresh is off). A scan runs in
+///    chunks of [_syncChunk]: the proxy then ends it, the app reads height and
+///    balance, saves every [_saveEvery], and starts the next chunk, which
+///    carries on from the same block. Closing, switching wallets or quitting
+///    ends a scan at once and saves it, so progress is never lost;
+///  * a user action while a chunk runs ends that chunk early, so wallet-rpc
+///    (which handles one call at a time) answers it straight away;
+///  * live progress comes from the block responses seen by the proxy;
 ///  * history, subaddresses and the address book are refreshed when the
 ///    balance changes, deferred while the wallet is still scanning, and
 ///    transfers are fetched incrementally by height.
@@ -50,11 +57,35 @@ class WalletService extends ChangeNotifier {
 
   WalletList walletList = WalletList();
 
-  // ---- sync tracking --------------------------------------------------------
-  int? scanHeight; // from wallet-rpc progress output while scanning
-  DateTime _lastSyncLine = DateTime.fromMillisecondsSinceEpoch(0);
-  bool _rpcSyncing = false;
-  Timer? _heartbeat;
+  // ---- sync -----------------------------------------------------------------
+  static const _syncChunk = Duration(seconds: 30);
+  static const _saveEvery = Duration(seconds: 60);
+  static const _idlePoll = Duration(seconds: 10);
+  static const _walletSwitchMethods = {
+    'open_wallet',
+    'create_wallet',
+    'close_wallet',
+    'restore_deterministic_wallet',
+    'restore_view_wallet',
+    'generate_from_keys',
+  };
+
+  DaemonProxy? _proxy;
+  StreamSubscription<ScanProgress>? _progressSub;
+  int _syncGeneration = 0;
+  Future<void>? _syncLoopDone;
+  Completer<void>? _wake;
+  bool _refreshing = false;
+  bool _caughtUp = false;
+  int? _rescanFrom; // skip scanning below this height after "rescan from height"
+
+  // Live progress
+  bool _headersOnly = false;
+  int _scanTarget = 0;
+  int? _scanFrom; // first block scanned this session, for a meaningful percentage
+  final _rateSamples = <(DateTime, int)>[];
+  DateTime _lastProgressNotify = DateTime.fromMillisecondsSinceEpoch(0);
+
   Timer? _bnsHeartbeat;
   bool _heartbeatInFlight = false;
   bool _historyRefreshPending = false;
@@ -72,25 +103,41 @@ class WalletService extends ChangeNotifier {
   final Set<String> _validAddresses = {};
   final Map<String, Future<bool>> _addressChecks = {};
 
-  static final _progressPatterns = [
-    RegExp(r'Processed block: <([a-f0-9]+)>, height (\d+)'),
-    RegExp(r'Skipped block by height: (\d+)'),
-    RegExp(r'Skipped block by timestamp, height: (\d+)'),
-    RegExp(r'Blockchain sync progress: <([a-f0-9]+)>, height (\d+)'),
-  ];
-
   String get walletDir => _config.walletDir;
 
   /// False until the first transfer list has been fetched (drives skeletons).
   bool get historyLoaded => _transfersLoaded;
   NetType get netType => _config.netType;
 
-  /// True while wallet-rpc is scanning blocks it hasn't seen yet.
-  bool get isSyncing {
-    if (_rpcSyncing) return true;
-    final daemonHeight = daemon.info.height;
-    if (daemonHeight == 0 || height == 0) return false;
-    return height < daemonHeight - 2;
+  /// True until the wallet has caught up with the node.
+  bool get isSyncing => isOpen && !_caughtUp;
+
+  @visibleForTesting
+  void debugMarkSynced() => _caughtUp = true;
+
+  /// Sync state for the UI.
+  SyncStatus get syncStatus {
+    final target = math.max(_scanTarget, daemon.info.height);
+    if (!isOpen || target == 0) return const SyncStatus(phase: SyncPhase.connecting);
+    if (_caughtUp) return SyncStatus(phase: SyncPhase.synced, height: height, target: target);
+    if (_headersOnly) {
+      return SyncStatus(phase: SyncPhase.headers, height: height, target: target);
+    }
+    return SyncStatus(
+      phase: SyncPhase.scanning,
+      height: height,
+      target: target,
+      from: _scanFrom ?? height,
+      blocksPerSecond: _blocksPerSecond(),
+    );
+  }
+
+  double _blocksPerSecond() {
+    if (_rateSamples.length < 2) return 0;
+    final (t0, h0) = _rateSamples.first;
+    final (t1, h1) = _rateSamples.last;
+    final secs = t1.difference(t0).inMilliseconds / 1000;
+    return secs < 2 ? 0 : (h1 - h0) / secs;
   }
 
   // ======================================================================
@@ -119,9 +166,14 @@ class WalletService extends ChangeNotifier {
     final user = randomHex(32);
     final pass = randomHex(32);
     final d = config.daemon;
-    final daemonAddress = d.type == DaemonType.remote
-        ? '${d.remoteHost}:${d.remotePort}'
-        : '${d.rpcBindIp}:${d.rpcBindPort}';
+    final proxy = _proxy = DaemonProxy(cacheDir: p.join(config.dataDir, 'cache', 'block-hashes', config.netType.name));
+    if (d.type == DaemonType.remote) {
+      await proxy.start(d.remoteHost, d.remotePort);
+    } else {
+      await proxy.start(d.rpcBindIp, d.rpcBindPort);
+    }
+    _progressSub = proxy.progress.listen(_onProgress);
+    final daemonAddress = '127.0.0.1:${proxy.port}';
     final args = [
       '--rpc-login',
       '$user:$pass',
@@ -149,8 +201,8 @@ class WalletService extends ChangeNotifier {
       _process = null;
       if (!exited.isCompleted) exited.complete(code);
     });
-    _process!.stdout.transform(utf8.decoder).listen(_onOutput);
-    _process!.stderr.transform(utf8.decoder).listen((_) {});
+    _process!.stdout.listen((_) {});
+    _process!.stderr.listen((_) {});
 
     while (true) {
       if (exited.isCompleted) {
@@ -158,6 +210,8 @@ class WalletService extends ChangeNotifier {
       }
       try {
         await _rpc!.call('get_languages', timeout: const Duration(seconds: 5));
+        // The app drives refreshes itself (see the class comment)
+        await _rpc!.call('auto_refresh', params: {'enable': false}, timeout: const Duration(seconds: 5));
         return;
       } on RpcError catch (e) {
         if (!e.isConnectionRefused && e.code != -1) rethrow;
@@ -166,63 +220,75 @@ class WalletService extends ChangeNotifier {
     }
   }
 
-  void _onOutput(String data) {
-    int? latest;
-    for (final line in data.split('\n')) {
-      for (final pattern in _progressPatterns) {
-        final m = pattern.firstMatch(line);
-        if (m != null) {
-          latest = int.tryParse(m.group(m.groupCount)!);
-          break;
-        }
-      }
+  void _onProgress(ScanProgress p) {
+    if (!isOpen) return;
+    _headersOnly = p.headersOnly;
+    if (p.target > _scanTarget) _scanTarget = p.target;
+    if (!p.headersOnly) {
+      _scanFrom ??= p.height;
+      final now = DateTime.now();
+      _rateSamples
+        ..add((now, p.height))
+        ..removeWhere((e) => now.difference(e.$1) > const Duration(seconds: 20));
+      if (p.height > height) height = p.height;
     }
-    if (latest != null) {
-      _lastSyncLine = DateTime.now();
-      scanHeight = latest;
-      if (latest > height) {
-        height = latest;
-        notifyListeners();
-      }
-    }
-    _updateSyncingFlag();
-  }
-
-  void _updateSyncingFlag() {
-    // At log level 0 wallet-rpc prints progress every 2000 blocks
-    final syncing = DateTime.now().difference(_lastSyncLine) < const Duration(seconds: 45);
-    if (syncing != _rpcSyncing) {
-      _rpcSyncing = syncing;
+    // Batches arrive several times a second; repaint at most every 250 ms
+    final now = DateTime.now();
+    if (now.difference(_lastProgressNotify) > const Duration(milliseconds: 250)) {
+      _lastProgressNotify = now;
       notifyListeners();
     }
   }
 
   Future<void> stop() async {
-    _heartbeat?.cancel();
     _bnsHeartbeat?.cancel();
     if (isOpen) {
       try {
         await closeWallet();
       } catch (_) {}
     }
+    await _stopSync();
     final proc = _process;
     if (proc != null) {
-      // A syncing wallet-rpc can take long to stop gracefully
-      proc.kill(_rpcSyncing ? ProcessSignal.sigkill : ProcessSignal.sigterm);
-      await proc.exitCode.timeout(
-        const Duration(seconds: 20),
-        onTimeout: () {
-          proc.kill(ProcessSignal.sigkill);
-          return -1;
-        },
-      );
+      // Nothing is scanning any more, so wallet-rpc exits promptly once idle
+      // keep-alive connections are gone
+      try {
+        await _rpc?.call('stop_wallet', timeout: const Duration(seconds: 5), closeConnection: true);
+      } catch (_) {}
+      _rpc?.close();
+      var code = await proc.exitCode.timeout(const Duration(seconds: 10), onTimeout: () => -1);
+      if (code == -1) {
+        proc.kill(ProcessSignal.sigterm);
+        code = await proc.exitCode.timeout(const Duration(seconds: 5), onTimeout: () => -1);
+        if (code == -1) proc.kill(ProcessSignal.sigkill);
+      }
     }
+    await _progressSub?.cancel();
+    _progressSub = null;
+    await _proxy?.close();
+    _proxy = null;
     _rpc?.close();
   }
 
-  Future<Map<String, dynamic>> _call(String method, [Map<String, dynamic>? params, Duration? timeout]) async {
+  /// [background] callers (BNS refreshes) wait for the current scan chunk
+  /// instead of ending it.
+  Future<Map<String, dynamic>> _call(
+    String method, [
+    Map<String, dynamic>? params,
+    Duration? timeout,
+    bool background = false,
+  ]) async {
     final rpc = _rpc;
     if (rpc == null) throw WalletException.i18n('notification.errors.unknownError');
+    // A scan holds wallet-rpc's only request thread: end the current chunk so
+    // this call is answered now (the sync loop then carries on).
+    if (_refreshing && !background && method != 'refresh') _proxy?.pause();
+    // Opening, creating or closing a wallet ends the current wallet's sync
+    // loop (the new wallet starts its own)
+    if (_walletSwitchMethods.contains(method)) {
+      _syncGeneration++;
+      _wakeSync();
+    }
     try {
       return await rpc.call(method, params: params, timeout: timeout);
     } on RpcError catch (e) {
@@ -472,9 +538,14 @@ class WalletService extends ChangeNotifier {
     );
   }
 
-  Future<Map<String, dynamic>?> _safeCall(String method, [Map<String, dynamic>? params, Duration? timeout]) async {
+  Future<Map<String, dynamic>?> _safeCall(
+    String method, [
+    Map<String, dynamic>? params,
+    Duration? timeout,
+    bool background = false,
+  ]) async {
     try {
-      return await _call(method, params, timeout);
+      return await _call(method, params, timeout, background);
     } catch (_) {
       return null;
     }
@@ -488,7 +559,12 @@ class WalletService extends ChangeNotifier {
     balance = 0;
     unlockedBalance = 0;
     viewOnly = false;
-    scanHeight = null;
+    _caughtUp = false;
+    _rescanFrom = null;
+    _headersOnly = false;
+    _scanTarget = 0;
+    _scanFrom = null;
+    _rateSamples.clear();
     transfers = const [];
     primaryAddresses = const [];
     usedAddresses = const [];
@@ -507,13 +583,12 @@ class WalletService extends ChangeNotifier {
   }
 
   Future<void> closeWallet() async {
-    _heartbeat?.cancel();
+    await _stopSync();
     _bnsHeartbeat?.cancel();
     _passwords.forget();
     _resetState();
     notifyListeners();
-    await _safeCall('store');
-    await _safeCall('close_wallet');
+    await _safeCall('close_wallet', {'autosave_current': true}, const Duration(minutes: 2));
   }
 
   // ======================================================================
@@ -521,31 +596,132 @@ class WalletService extends ChangeNotifier {
   // ======================================================================
 
   void _startHeartbeat() {
-    _heartbeat?.cancel();
-    _heartbeat = Timer.periodic(const Duration(seconds: 8), (_) => _heartbeatTick());
     _historyRefreshPending = true;
-    _heartbeatTick(initial: true);
-    _startSync();
     _bnsHeartbeat?.cancel();
     _bnsHeartbeat = Timer.periodic(const Duration(seconds: 80), (_) {
       if (!isSyncing) refreshBnsRecords();
     });
+    _startSyncLoop();
   }
 
-  void _startSync() {
-    unawaited(_safeCall('auto_refresh', {'enable': true, 'period': 10}));
-    _safeCall('refresh').then((r) async {
-      if (r == null) return;
-      _lastSyncLine = DateTime.fromMillisecondsSinceEpoch(0);
-      _updateSyncingFlag();
-      final h = await _safeCall('getheight', null, const Duration(seconds: 5));
-      final newHeight = (h?['height'] as num?)?.toInt();
-      if (newHeight != null && newHeight != height) {
-        height = newHeight;
+  void _startSyncLoop() {
+    final generation = ++_syncGeneration;
+    _rescanFrom ??= _readRescanFrom();
+    _syncLoopDone = _syncLoop(generation);
+  }
+
+  /// An unfinished "rescan from height" is kept next to the wallet, so it
+  /// carries on after a restart (in either app: they share the wallet folder).
+  File get _rescanFromFile => File(p.join(walletDir, '$name.rescan-from'));
+
+  int? _readRescanFrom() {
+    try {
+      return _rescanFromFile.existsSync() ? int.tryParse(_rescanFromFile.readAsStringSync().trim()) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _setRescanFrom(int? height) async {
+    _rescanFrom = height;
+    try {
+      if (height != null) {
+        await _rescanFromFile.writeAsString('$height');
+      } else if (await _rescanFromFile.exists()) {
+        await _rescanFromFile.delete();
+      }
+    } catch (_) {
+      // Only matters if the app is closed mid-rescan
+    }
+  }
+
+  /// Ends a running scan within a second and waits for the sync loop to exit.
+  /// Everything scanned so far stays in the wallet (the caller saves it).
+  Future<void> _stopSync() async {
+    _syncGeneration++;
+    _wakeSync();
+    final done = _syncLoopDone;
+    _syncLoopDone = null;
+    if (done == null) return;
+    _proxy?.pause();
+    await done.timeout(const Duration(seconds: 20), onTimeout: () {});
+    _proxy?.resume();
+  }
+
+  /// Starts the next refresh now instead of after the idle wait.
+  void _wakeSync() {
+    final wake = _wake;
+    _wake = null;
+    if (wake != null && !wake.isCompleted) wake.complete();
+  }
+
+  Future<void> _idle(Duration duration, int generation) async {
+    if (generation != _syncGeneration) return;
+    final wake = _wake = Completer<void>();
+    await Future.any([wake.future, Future<void>.delayed(duration)]);
+    if (identical(_wake, wake)) _wake = null;
+  }
+
+  Future<void> _syncLoop(int generation) async {
+    bool current() => generation == _syncGeneration && isOpen;
+    await _heartbeatTick(initial: true); // history from the wallet cache, before scanning
+    if (current()) unawaited(refreshBnsRecords());
+    var lastSave = DateTime.now();
+    var savedHeight = height;
+    var failures = 0;
+    while (current()) {
+      var chunkEnded = false;
+      final chunk = Timer(_syncChunk, () {
+        chunkEnded = true;
+        _proxy?.pause();
+      });
+      Object? error;
+      _refreshing = true;
+      try {
+        final from = _rescanFrom;
+        await _call('refresh', {if (from != null) 'start_height': from}, const Duration(hours: 24));
+      } catch (e) {
+        error = e;
+      } finally {
+        _refreshing = false;
+        chunk.cancel();
+      }
+      final interrupted = chunkEnded || (_proxy?.paused ?? false);
+      _proxy?.resume();
+      if (generation != _syncGeneration) break;
+
+      await _heartbeatTick();
+      if (!current()) break;
+
+      final caughtUp = error == null && !interrupted;
+      if (caughtUp != _caughtUp) {
+        _caughtUp = caughtUp;
+        if (caughtUp) {
+          _headersOnly = false;
+          _scanFrom = null;
+          _rateSamples.clear();
+          unawaited(refreshBnsRecords());
+        }
         notifyListeners();
       }
-      unawaited(refreshBnsRecords());
-    });
+      // "Rescan from height" passes start_height until the wallet reaches it
+      // (wallet2 skips blocks below the wallet's own restore height anyway)
+      if (_rescanFrom != null && height >= _rescanFrom!) await _setRescanFrom(null);
+      // Save regularly while scanning (crash / power loss) and once caught up
+      if (height > savedHeight && (caughtUp || DateTime.now().difference(lastSave) >= _saveEvery)) {
+        await _safeCall('store', null, const Duration(minutes: 2));
+        lastSave = DateTime.now();
+        savedHeight = height;
+      }
+      if (caughtUp) {
+        failures = 0;
+        await _idle(_idlePoll, generation);
+      } else if (error != null && !interrupted) {
+        // Node unreachable or busy: back off, but keep trying
+        failures++;
+        await _idle(Duration(seconds: math.min(30, 2 * failures)), generation);
+      }
+    }
   }
 
   Future<void> _heartbeatTick({bool initial = false}) async {
@@ -575,7 +751,6 @@ class WalletService extends ChangeNotifier {
           changed = true;
         }
       }
-      _updateSyncingFlag();
       if (changed) notifyListeners();
 
       final refreshDue =
@@ -601,6 +776,7 @@ class WalletService extends ChangeNotifier {
 
   /// Manual "refresh balance" button: full reload.
   Future<void> refreshAll() async {
+    _wakeSync();
     balanceLoading = true;
     notifyListeners();
     try {
@@ -740,13 +916,32 @@ class WalletService extends ChangeNotifier {
     return true;
   }
 
-  Future<void> rescanBlockchain() async {
+  /// Rescans from the wallet's restore height, or from [fromHeight] (blocks
+  /// below it are skipped, which is much faster when you know roughly when
+  /// the funds arrived). wallet2 never scans below the wallet's restore
+  /// height, so an earlier [fromHeight] can't find older transactions. Runs in the sync loop, so it shows progress, keeps
+  /// the app responsive and survives closing the wallet.
+  Future<void> rescanBlockchain({int? fromHeight}) async {
+    await _stopSync();
+    // rescan_blockchain clears the wallet and then refreshes inline; with
+    // block sync paused that refresh ends at once and the loop takes over.
+    _proxy?.pause();
+    try {
+      await _call('rescan_blockchain', {'hard': false});
+    } catch (_) {
+      // Expected: the inline refresh was cut short
+    } finally {
+      _proxy?.resume();
+    }
     _resetCaches();
     height = 0;
-    notifyListeners();
-    await _call('rescan_blockchain');
+    _caughtUp = false;
+    _scanFrom = null;
+    _rateSamples.clear();
+    await _setRescanFrom(fromHeight);
     _historyRefreshPending = true;
-    unawaited(_heartbeatTick());
+    notifyListeners();
+    if (isOpen) _startSyncLoop();
   }
 
   Future<void> rescanSpent() => _call('rescan_spent');
@@ -979,6 +1174,7 @@ class WalletService extends ChangeNotifier {
       }
     }
     _historyRefreshPending = true;
+    _wakeSync();
     unawaited(_heartbeatTick());
     return hashes;
   }
@@ -1124,13 +1320,13 @@ class WalletService extends ChangeNotifier {
   Future<void> refreshBnsRecords() async {
     if (!isOpen) return;
     try {
-      final addrData = await _call('get_address', {'account_index': 0}, const Duration(seconds: 5));
+      final addrData = await _call('get_address', {'account_index': 0}, null, true);
       final owners = (addrData['addresses'] as List? ?? const [])
           .map((a) => (a as Map)['address'] as String?)
           .whereType<String>()
           .toList();
       final records = await daemon.bnsRecordsForOwners(owners);
-      final known = await _safeCall('bns_known_names', {'decrypt': true, 'include_expired': false});
+      final known = await _safeCall('bns_known_names', {'decrypt': true, 'include_expired': false}, null, true);
       final knownByHash = {
         for (final k in (known?['known_names'] as List? ?? const [])) (k as Map)['hashed']: k.cast<String, dynamic>(),
       };
@@ -1193,7 +1389,7 @@ class WalletService extends ChangeNotifier {
 
   @override
   void dispose() {
-    _heartbeat?.cancel();
+    _syncGeneration++;
     _bnsHeartbeat?.cancel();
     super.dispose();
   }
