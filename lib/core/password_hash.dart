@@ -14,19 +14,24 @@ class PasswordHasher {
 
   static const _iterations = 200000;
   final Uint8List _salt;
-  Uint8List? _hash;
+  Future<Uint8List>? _hash;
 
   bool get hasHash => _hash != null;
 
-  Future<void> remember(String password) async {
-    _hash = await _derive(password, _salt);
+  /// Starts hashing [password] in the background, so opening a wallet
+  /// doesn't wait for it; [verify] waits if it hasn't finished yet.
+  void remember(String password) {
+    final pending = _derive(password, _salt);
+    pending.ignore(); // errors surface in verify()
+    _hash = pending;
   }
 
   void forget() => _hash = null;
 
   Future<bool> verify(String password) async {
-    final stored = _hash;
-    if (stored == null) return true;
+    final pending = _hash;
+    if (pending == null) return true;
+    final stored = await pending;
     final candidate = await _derive(password, _salt);
     // Constant-time comparison
     var diff = 0;

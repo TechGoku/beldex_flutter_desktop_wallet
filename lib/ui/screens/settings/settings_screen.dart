@@ -37,8 +37,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await app.saveConfigAndStart(_pending.copy());
       return;
     }
-    final needsRestart = await app.saveSettings(_pending.copy());
-    if (!mounted) return;
+    // A new node on the same network is switched to live (the wallet stays
+    // open); only network or folder changes need a restart.
+    final needsRestart = await runWithProgress(
+      context,
+      () => app.saveSettings(_pending.copy()),
+      message: 'Connecting to the node…',
+    );
+    // null: the node didn't answer (already reported); nothing changed
+    if (needsRestart == null || !mounted) return;
     if (needsRestart) {
       final restart = await confirmDialog(
         context,
@@ -52,9 +59,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
         await app.saveConfigAndStart(app.config);
         return;
       }
+    } else {
+      app.notify('Now using ${_nodeLabel(app.config)}');
     }
     navigator.pop();
   }
+
+  static String _nodeLabel(AppConfig c) => switch (c.daemon.type) {
+    DaemonType.remote => '${c.daemon.remoteHost}:${c.daemon.remotePort}',
+    DaemonType.local => 'your local node',
+    DaemonType.localRemote => 'your local node (with ${c.daemon.remoteHost} while it syncs)',
+  };
 
   @override
   Widget build(BuildContext context) {

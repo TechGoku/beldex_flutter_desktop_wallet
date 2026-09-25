@@ -78,7 +78,8 @@ void main() {
 
   test('password hasher verifies in a background isolate', () async {
     final h = PasswordHasher();
-    await h.remember('secret');
+    h.remember('secret'); // returns at once; verify waits for the hash
+    expect(h.hasHash, isTrue);
     expect(await h.verify('secret'), isTrue);
     expect(await h.verify('wrong'), isFalse);
     expect(await h.hasPassword(), isTrue);

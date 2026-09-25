@@ -22,6 +22,9 @@ class AppNotice {
 class AppController extends ChangeNotifier {
   AppController() {
     wallet = WalletService(daemon);
+    wallet.onUnexpectedExit = _recoverWallet;
+    daemon.onUnexpectedExit = _restartLocalNode;
+    daemon.onUnreachable = _failover;
     // A closed wallet can't be locked; the next one opens unlocked
     wallet.addListener(() {
       if (!wallet.isOpen && locked) {
@@ -120,13 +123,98 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Saves settings; returns true when a restart is needed to apply them.
+  /// Saves settings. A different node on the same network is switched to
+  /// live: the open wallet stays open and keeps syncing from the same block.
+  /// Throws if that node doesn't answer (nothing changes then). Returns true
+  /// when a restart is still needed (network or data folders changed).
   Future<bool> saveSettings(AppConfig newConfig) async {
+    if (!_sameConnection(config, newConfig) && _onlyNodeChanged(config, newConfig)) {
+      await switchNode(newConfig);
+      return false;
+    }
     final restart = !_sameConnection(config, newConfig);
     config = newConfig;
     await config.save();
     notifyListeners();
     return restart;
+  }
+
+  /// Switches to [next]'s node without restarting anything.
+  Future<void> switchNode(AppConfig next) async {
+    await daemon.switchTo(next);
+    final d = next.daemon;
+    if (d.type == DaemonType.remote) {
+      wallet.setNode(d.remoteHost, d.remotePort);
+    } else {
+      wallet.setNode(d.rpcBindIp, d.rpcBindPort);
+    }
+    config = next;
+    await config.save();
+    notifyListeners();
+  }
+
+  static bool _onlyNodeChanged(AppConfig a, AppConfig b) {
+    if (a.netType != b.netType) return false;
+    final net = a.netType.name;
+    Map<String, Object?> rest(AppConfig c) =>
+        Map.of(_flatten(c.toJson()))
+          ..removeWhere((k, _) => k == 'language' || k == 'dark_theme' || k.startsWith('daemons.$net.'));
+    return mapEquals(rest(a), rest(b));
+  }
+
+  // ---- recovery ------------------------------------------------------------
+
+  bool _failingOver = false;
+
+  /// The remote node stopped answering: move to a working public node.
+  Future<void> _failover() async {
+    final d = config.daemon;
+    if (_failingOver || d.type != DaemonType.remote || stage != StartupStage.ready) return;
+    _failingOver = true;
+    try {
+      final next = await daemon.findWorkingRemote(config.netType, exclude: d.remoteHost);
+      if (next == null) {
+        notify('${d.remoteHost} is not answering and no other node is reachable; still trying', warning: true);
+        return;
+      }
+      final c = config.copy();
+      c.daemon
+        ..remoteHost = next.host
+        ..remotePort = next.port;
+      final previous = d.remoteHost;
+      await switchNode(c);
+      notify('$previous stopped answering; switched to ${next.host}', warning: true);
+    } catch (_) {
+      // Keep the current node; the next failed check tries again
+    } finally {
+      _failingOver = false;
+    }
+  }
+
+  /// wallet-rpc exited unexpectedly: restart it and go back to unlock.
+  Future<void> _recoverWallet(int exitCode) async {
+    if (stage != StartupStage.ready) return;
+    final wasOpen = wallet.isOpen;
+    try {
+      await wallet.recoverFromCrash();
+      if (wasOpen) {
+        notify('The wallet service stopped unexpectedly and was restarted. Unlock your wallet again.', error: true);
+      }
+    } catch (e) {
+      failure = 'The wallet service stopped and could not be restarted: $e';
+      _setStage(StartupStage.failed);
+    }
+  }
+
+  /// A local beldexd exited unexpectedly: start it again.
+  Future<void> _restartLocalNode(int exitCode) async {
+    if (stage != StartupStage.ready) return;
+    notify('The local node stopped unexpectedly and is restarting', warning: true);
+    try {
+      await daemon.start(config);
+    } catch (e) {
+      notify('Could not restart the local node: $e', error: true);
+    }
   }
 
   static bool _sameConnection(AppConfig a, AppConfig b) {

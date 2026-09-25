@@ -45,6 +45,17 @@ class DaemonService extends ChangeNotifier {
 
   String _lastInfoFingerprint = '';
 
+  /// Called once a remote node has failed [_unreachableAfter] checks in a
+  /// row, so the app can switch to another node.
+  void Function()? onUnreachable;
+
+  /// Called when a local beldexd exits without being asked to.
+  void Function(int exitCode)? onUnexpectedExit;
+
+  static const _unreachableAfter = 2;
+  int _failedChecks = 0;
+  bool _running = false; // local beldexd started and not being stopped
+
   Uri _endpoint(String host, int port) => Uri.parse('http://$host:$port/json_rpc');
 
   /// Checks a remote node and returns its network type, or throws.
@@ -103,7 +114,20 @@ class DaemonService extends ChangeNotifier {
       throw StateError('beldexd not found. Please make sure your anti-virus has not removed it.');
     }
     if (!await isPortFree(daemon.rpcBindPort)) {
-      throw StateError('Local daemon port ${daemon.rpcBindPort} is in use');
+      // Usually a beldexd from an earlier session (or one still shutting
+      // down): reuse it if it's a healthy node on our network.
+      final client = JsonRpcClient(endpoint: _endpoint(daemon.rpcBindIp, daemon.rpcBindPort), concurrency: 4);
+      try {
+        final r = await client.call('get_info', timeout: const Duration(seconds: 5));
+        final nettype = r['nettype'] as String? ?? '';
+        if (nettype.isNotEmpty && nettype != config.netType.name) throw StateError('different network');
+      } catch (_) {
+        client.close();
+        throw StateError('Local daemon port ${daemon.rpcBindPort} is in use');
+      }
+      _rpc = client;
+      _startHeartbeats();
+      return;
     }
 
     await Directory(config.logDir).create(recursive: true);
@@ -139,11 +163,15 @@ class DaemonService extends ChangeNotifier {
     ];
 
     _rpc = JsonRpcClient(endpoint: _endpoint(daemon.rpcBindIp, daemon.rpcBindPort), concurrency: 4);
-    _process = await Process.start(binary, args);
+    final process = _process = await Process.start(binary, args);
     final exited = Completer<int>();
-    _process!.exitCode.then((code) {
-      _process = null;
+    process.exitCode.then((code) {
+      if (identical(_process, process)) _process = null;
       if (!exited.isCompleted) exited.complete(code);
+      if (_running && identical(_runningProcess, process)) {
+        _running = false;
+        onUnexpectedExit?.call(code);
+      }
     });
     _process!.stdout.transform(utf8.decoder).listen(_appendLog);
     _process!.stderr.transform(utf8.decoder).listen(_appendLog);
@@ -162,7 +190,72 @@ class DaemonService extends ChangeNotifier {
       }
       await Future.delayed(const Duration(seconds: 1));
     }
+    _runningProcess = process;
+    _running = true;
     _startHeartbeats();
+  }
+
+  Process? _runningProcess;
+
+  /// Switches to the node in [config] (same network) without touching the
+  /// wallet: remote nodes are checked first and swapped in; a local node is
+  /// (re)started. Throws, leaving the current node in place, if the new one
+  /// doesn't answer.
+  Future<void> switchTo(AppConfig config) async {
+    final d = config.daemon;
+    if (d.type == DaemonType.remote) {
+      final client = JsonRpcClient(endpoint: _endpoint(d.remoteHost, d.remotePort), concurrency: 4);
+      try {
+        final r = await client.call('get_info', timeout: const Duration(seconds: 15));
+        final nettype = r['nettype'] as String? ?? '';
+        if (nettype.isNotEmpty && nettype != config.netType.name) {
+          throw StateError('That node is on $nettype, not ${config.netType.name}');
+        }
+        info = DaemonInfo(r);
+      } catch (_) {
+        client.close();
+        rethrow;
+      }
+      _stopHeartbeats();
+      final old = _rpc;
+      _rpc = client;
+      old?.close();
+      local = false;
+      _failedChecks = 0;
+      _lastInfoFingerprint = '';
+      // A local node isn't needed any more; let it shut down in the background
+      unawaited(_stopProcess());
+      _startHeartbeats();
+      notifyListeners();
+      return;
+    }
+    _stopHeartbeats();
+    await _stopProcess();
+    _rpc?.close();
+    await start(config);
+    notifyListeners();
+  }
+
+  void _stopHeartbeats() {
+    _heartbeat?.cancel();
+    _slowHeartbeat?.cancel();
+    _masterNodeHeartbeat?.cancel();
+  }
+
+  /// Stops a local beldexd gracefully (SIGTERM, then SIGKILL after 20 s).
+  Future<void> _stopProcess() async {
+    _running = false;
+    final proc = _process;
+    _process = null;
+    if (proc == null) return;
+    proc.kill(ProcessSignal.sigterm);
+    await proc.exitCode.timeout(
+      const Duration(seconds: 20),
+      onTimeout: () {
+        proc.kill(ProcessSignal.sigkill);
+        return -1;
+      },
+    );
   }
 
   void _appendLog(String data) {
@@ -191,6 +284,7 @@ class DaemonService extends ChangeNotifier {
   Future<void> _refreshInfo() async {
     try {
       final r = await _rpc!.call('get_info', timeout: const Duration(seconds: 10));
+      _failedChecks = 0;
       // Only rebuild listeners when something actually changed
       final fingerprint =
           '${r['height']}|${r['target_height']}|${r['height_without_bootstrap']}|'
@@ -199,7 +293,10 @@ class DaemonService extends ChangeNotifier {
       _lastInfoFingerprint = fingerprint;
       info = DaemonInfo(r);
       notifyListeners();
-    } catch (_) {}
+    } catch (_) {
+      if (!local && ++_failedChecks == _unreachableAfter) onUnreachable?.call();
+      return;
+    }
   }
 
   Future<void> refreshPeers() async {
@@ -287,20 +384,8 @@ class DaemonService extends ChangeNotifier {
   }
 
   Future<void> stop() async {
-    _heartbeat?.cancel();
-    _slowHeartbeat?.cancel();
-    _masterNodeHeartbeat?.cancel();
-    final proc = _process;
-    if (proc != null) {
-      proc.kill(ProcessSignal.sigterm);
-      await proc.exitCode.timeout(
-        const Duration(seconds: 20),
-        onTimeout: () {
-          proc.kill(ProcessSignal.sigkill);
-          return -1;
-        },
-      );
-    }
+    _stopHeartbeats();
+    await _stopProcess();
     _rpc?.close();
   }
 }

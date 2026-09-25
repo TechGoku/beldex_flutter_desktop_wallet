@@ -71,6 +71,10 @@ class WalletService extends ChangeNotifier {
   };
 
   DaemonProxy? _proxy;
+
+  /// Called when wallet-rpc exits without being asked to (see [recoverFromCrash]).
+  void Function(int exitCode)? onUnexpectedExit;
+  bool _running = false; // started and not being stopped
   StreamSubscription<ScanProgress>? _progressSub;
   int _syncGeneration = 0;
   Future<void>? _syncLoopDone;
@@ -195,11 +199,15 @@ class WalletService extends ChangeNotifier {
     ];
 
     _rpc = JsonRpcClient(endpoint: Uri.parse('http://127.0.0.1:$port/json_rpc'), username: user, password: pass);
-    _process = await Process.start(binary, args);
+    final process = _process = await Process.start(binary, args);
     final exited = Completer<int>();
-    _process!.exitCode.then((code) {
-      _process = null;
+    process.exitCode.then((code) {
+      if (identical(_process, process)) _process = null;
       if (!exited.isCompleted) exited.complete(code);
+      if (_running) {
+        _running = false;
+        onUnexpectedExit?.call(code);
+      }
     });
     _process!.stdout.listen((_) {});
     _process!.stderr.listen((_) {});
@@ -212,6 +220,7 @@ class WalletService extends ChangeNotifier {
         await _rpc!.call('get_languages', timeout: const Duration(seconds: 5));
         // The app drives refreshes itself (see the class comment)
         await _rpc!.call('auto_refresh', params: {'enable': false}, timeout: const Duration(seconds: 5));
+        _running = true;
         return;
       } on RpcError catch (e) {
         if (!e.isConnectionRefused && e.code != -1) rethrow;
@@ -241,6 +250,7 @@ class WalletService extends ChangeNotifier {
   }
 
   Future<void> stop() async {
+    _running = false;
     _bnsHeartbeat?.cancel();
     if (isOpen) {
       try {
@@ -268,6 +278,39 @@ class WalletService extends ChangeNotifier {
     await _proxy?.close();
     _proxy = null;
     _rpc?.close();
+  }
+
+  /// Points wallet-rpc at another node without restarting it or closing the
+  /// wallet: the current scan chunk ends and the next one continues from the
+  /// same block on the new node.
+  void setNode(String host, int port) {
+    final proxy = _proxy;
+    if (proxy == null) return;
+    proxy.setTarget(host, port);
+    if (_refreshing) proxy.pause(); // the sync loop resumes it
+    _wakeSync();
+  }
+
+  @visibleForTesting
+  String? get debugNodeHost => _proxy?.targetHost;
+
+  /// wallet-rpc exited unexpectedly: start a new one. An open wallet is
+  /// closed (its progress up to the last save is kept; reopening needs the
+  /// password), so the app goes back to the unlock screen.
+  Future<void> recoverFromCrash() async {
+    _syncGeneration++;
+    _bnsHeartbeat?.cancel();
+    _passwords.forget();
+    _resetState();
+    notifyListeners();
+    await _progressSub?.cancel();
+    _progressSub = null;
+    await _proxy?.close();
+    _proxy = null;
+    _rpc?.close();
+    await start(_config);
+    await listWallets();
+    notifyListeners();
   }
 
   /// [background] callers (BNS refreshes) wait for the current scan chunk
@@ -502,7 +545,7 @@ class WalletService extends ChangeNotifier {
   }
 
   Future<WalletSecrets> _afterOpen(String walletName, String password, {required bool revealSecrets}) async {
-    await _passwords.remember(password);
+    _passwords.remember(password); // hashed in the background
     _resetState();
     isOpen = true;
     name = walletName;
@@ -526,7 +569,6 @@ class WalletService extends ChangeNotifier {
     if (address.isNotEmpty && !await addressTxt.exists()) {
       await addressTxt.writeAsString(address);
     }
-    unawaited(_safeCall('store'));
     unawaited(listWallets());
 
     _startHeartbeat();
@@ -664,11 +706,15 @@ class WalletService extends ChangeNotifier {
 
   Future<void> _syncLoop(int generation) async {
     bool current() => generation == _syncGeneration && isOpen;
-    await _heartbeatTick(initial: true); // history from the wallet cache, before scanning
-    if (current()) unawaited(refreshBnsRecords());
-    var lastSave = DateTime.now();
-    var savedHeight = height;
-    var failures = 0;
+    try {
+      await _heartbeatTick(initial: true); // history from the wallet cache, before scanning
+      if (current()) unawaited(refreshBnsRecords());
+    } catch (e, st) {
+      debugPrint('Initial wallet refresh failed: $e\n$st');
+    }
+    _lastSave = DateTime.now();
+    _savedHeight = height;
+    _failures = 0;
     while (current()) {
       var chunkEnded = false;
       final chunk = Timer(_syncChunk, () {
@@ -690,37 +736,52 @@ class WalletService extends ChangeNotifier {
       _proxy?.resume();
       if (generation != _syncGeneration) break;
 
-      await _heartbeatTick();
-      if (!current()) break;
+      // Anything unexpected below must not end syncing for this wallet
+      try {
+        await _afterChunk(generation, error, interrupted);
+      } catch (e, st) {
+        debugPrint('Sync loop error: $e\n$st');
+        await _idle(const Duration(seconds: 5), generation);
+      }
+    }
+  }
 
-      final caughtUp = error == null && !interrupted;
-      if (caughtUp != _caughtUp) {
-        _caughtUp = caughtUp;
-        if (caughtUp) {
-          _headersOnly = false;
-          _scanFrom = null;
-          _rateSamples.clear();
-          unawaited(refreshBnsRecords());
-        }
-        notifyListeners();
-      }
-      // "Rescan from height" passes start_height until the wallet reaches it
-      // (wallet2 skips blocks below the wallet's own restore height anyway)
-      if (_rescanFrom != null && height >= _rescanFrom!) await _setRescanFrom(null);
-      // Save regularly while scanning (crash / power loss) and once caught up
-      if (height > savedHeight && (caughtUp || DateTime.now().difference(lastSave) >= _saveEvery)) {
-        await _safeCall('store', null, const Duration(minutes: 2));
-        lastSave = DateTime.now();
-        savedHeight = height;
-      }
+  var _lastSave = DateTime.now();
+  var _savedHeight = 0;
+  var _failures = 0;
+
+  Future<void> _afterChunk(int generation, Object? error, bool interrupted) async {
+    bool current() => generation == _syncGeneration && isOpen;
+    await _heartbeatTick();
+    if (!current()) return;
+
+    final caughtUp = error == null && !interrupted;
+    if (caughtUp != _caughtUp) {
+      _caughtUp = caughtUp;
       if (caughtUp) {
-        failures = 0;
-        await _idle(_idlePoll, generation);
-      } else if (error != null && !interrupted) {
-        // Node unreachable or busy: back off, but keep trying
-        failures++;
-        await _idle(Duration(seconds: math.min(30, 2 * failures)), generation);
+        _headersOnly = false;
+        _scanFrom = null;
+        _rateSamples.clear();
+        unawaited(refreshBnsRecords());
       }
+      notifyListeners();
+    }
+    // "Rescan from height" passes start_height until the wallet reaches it
+    // (wallet2 skips blocks below the wallet's own restore height anyway)
+    if (_rescanFrom != null && height >= _rescanFrom!) await _setRescanFrom(null);
+    // Save regularly while scanning (crash / power loss) and once caught up
+    if (height > _savedHeight && (caughtUp || DateTime.now().difference(_lastSave) >= _saveEvery)) {
+      await _safeCall('store', null, const Duration(minutes: 2));
+      _lastSave = DateTime.now();
+      _savedHeight = height;
+    }
+    if (caughtUp) {
+      _failures = 0;
+      await _idle(_idlePoll, generation);
+    } else if (error != null && !interrupted) {
+      // Node unreachable or busy: back off, but keep trying
+      _failures++;
+      await _idle(Duration(seconds: math.min(30, 2 * _failures)), generation);
     }
   }
 
@@ -1018,7 +1079,7 @@ class WalletService extends ChangeNotifier {
     } catch (_) {
       throw WalletException.i18n('notification.errors.changingPassword');
     }
-    await _passwords.remember(newPassword);
+    _passwords.remember(newPassword);
   }
 
   Future<void> deleteWallet(String password) async {

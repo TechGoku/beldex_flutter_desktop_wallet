@@ -140,6 +140,85 @@ void main() {
   );
 
   test(
+    'switch node while scanning, open/close timing, recover from a wallet-rpc crash',
+    () async {
+      final (daemon, wallet, tmp) = await boot(29399);
+      final crashes = <int>[];
+      wallet.onUnexpectedExit = crashes.add;
+      try {
+        final seed = (await wallet.createWallet('src', 'pw', 'English')).mnemonic;
+        await wallet.closeWallet();
+        final tip = daemon.info.height;
+        final restoreHeight = tip - 40000;
+        await wallet.restoreFromSeed('sw', 'pw', seed, restoreHeight);
+        await waitFor(
+          () => wallet.syncStatus.phase == SyncPhase.scanning && wallet.height > restoreHeight + 3000,
+          const Duration(minutes: 3),
+          'scanning',
+        );
+
+        // Switch to another public node mid-scan: no restart, no reopen
+        final other = (await daemon.findWorkingRemote(NetType.mainnet, exclude: wallet.debugNodeHost))!;
+
+        // A node that doesn't answer is refused and nothing changes
+        final dead = AppConfig.defaults();
+        dead.daemon
+          ..type = DaemonType.remote
+          ..remoteHost = '127.0.0.1'
+          ..remotePort = 1;
+        final host = wallet.debugNodeHost;
+        await expectLater(daemon.switchTo(dead), throwsA(anything));
+        expect(wallet.debugNodeHost, host);
+        final config = AppConfig.defaults()
+          ..dataDir = '${tmp.path}/data'
+          ..walletDataDir = '${tmp.path}/wallets';
+        config.daemon
+          ..type = DaemonType.remote
+          ..remoteHost = other.host
+          ..remotePort = other.port;
+        final before = wallet.height;
+        final sw = Stopwatch()..start();
+        await daemon.switchTo(config);
+        wallet.setNode(other.host, other.port);
+        // ignore: avoid_print
+        print('switched node to ${other.host} in ${sw.elapsedMilliseconds} ms at height $before');
+        expect(wallet.isOpen, isTrue);
+        await waitFor(() => wallet.height > before + 3000, const Duration(minutes: 2), 'scanning on the new node');
+        expect(wallet.debugNodeHost, other.host);
+        await waitFor(() => wallet.syncStatus.phase == SyncPhase.synced, const Duration(minutes: 5), 'sync');
+
+        final close = Stopwatch()..start();
+        await wallet.closeWallet();
+        final open = Stopwatch()..start();
+        await wallet.openWallet('sw', 'pw');
+        // ignore: avoid_print
+        print('close ${close.elapsedMilliseconds - open.elapsedMilliseconds} ms, open ${open.elapsedMilliseconds} ms');
+        expect(open.elapsed, lessThan(const Duration(seconds: 5)));
+
+        // Kill wallet-rpc outright: the service restarts it; the wallet reopens
+        final saved = wallet.height;
+        await Process.run('pkill', ['-9', '-f', 'beldex-wallet-rpc.*${tmp.path}']);
+        await waitFor(() => crashes.isNotEmpty, const Duration(seconds: 10), 'crash noticed');
+        final recover = Stopwatch()..start();
+        await wallet.recoverFromCrash();
+        expect(wallet.isOpen, isFalse);
+        await wallet.openWallet('sw', 'pw');
+        // ignore: avoid_print
+        print(
+          'recovered from a wallet-rpc crash and reopened in ${recover.elapsedMilliseconds} ms at ${wallet.height}',
+        );
+        expect(wallet.height, greaterThanOrEqualTo(saved - 10));
+      } finally {
+        await wallet.stop();
+        await daemon.stop();
+        await tmp.delete(recursive: true);
+      }
+    },
+    skip: bin == null ? 'set BELDEX_BIN_DIR to run' : false,
+    timeout: const Timeout(Duration(minutes: 15)),
+  );
+
+  test(
     'create, restore+sync, address book, send validation',
     () async {
       final tmp = await Directory.systemTemp.createTemp('bdx');

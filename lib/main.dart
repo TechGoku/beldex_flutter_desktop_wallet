@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:ui' show AppExitResponse;
+import 'dart:ui' show AppExitResponse, PlatformDispatcher;
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -20,6 +20,19 @@ import 'ui/widgets/common.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Unexpected errors are logged and the app carries on, instead of
+  // unhandled async errors taking it down or a grey box replacing a screen.
+  FlutterError.onError = FlutterError.presentError;
+  PlatformDispatcher.instance.onError = (error, stack) {
+    debugPrint('Unhandled error: $error\n$stack');
+    return true;
+  };
+  ErrorWidget.builder = (details) => const Center(
+    child: Padding(
+      padding: EdgeInsets.all(16),
+      child: Text('Something went wrong here. Try going back.', style: TextStyle(color: Color(0xFF8A8A8A))),
+    ),
+  );
   final app = AppController();
   runApp(BeldexWalletApp(controller: app));
   unawaited(app.boot());

@@ -65,6 +65,8 @@ class DaemonProxy {
     _server!.listen(_handle);
   }
 
+  String get targetHost => _target.host;
+
   /// Points the proxy at another node; wallet-rpc doesn't need a restart.
   void setTarget(String host, int port) => _target = Uri(scheme: 'http', host: host, port: port);
 
